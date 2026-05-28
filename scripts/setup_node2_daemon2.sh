@@ -66,8 +66,8 @@ ban_for_bandwidth = on
 ban_for_flows = on
 
 # Ngưỡng tổng - ĐIỀU CHỈNH SAU KHI XEM TRAFFIC BÌNH THƯỜNG
-threshold_pps = 10000
-threshold_mbps = 500
+threshold_pps = 50000
+threshold_mbps = 100
 threshold_flows = 3500
 
 # Per-protocol (game server cần chú ý UDP)
@@ -75,17 +75,17 @@ ban_for_tcp_pps = on
 ban_for_udp_pps = on
 ban_for_icmp_pps = on
 
-threshold_tcp_pps = 10000
-threshold_udp_pps = 5000
-threshold_icmp_pps = 1000
+threshold_tcp_pps = 30000
+threshold_udp_pps = 30000
+threshold_icmp_pps = 5000
 
 ban_for_tcp_bandwidth = on
 ban_for_udp_bandwidth = on
 ban_for_icmp_bandwidth = on
 
-threshold_tcp_mbps = 500
-threshold_udp_mbps = 300
-threshold_icmp_mbps = 50
+threshold_tcp_mbps = 50
+threshold_udp_mbps = 50
+threshold_icmp_mbps = 10
 
 # Capture trên ens18
 mirror_afpacket = on
@@ -149,9 +149,8 @@ ACTION="$4"
 # PASTE DISCORD WEBHOOK URL:
 DISCORD_WEBHOOK=""
 
-# Node phụ cần sync
-REMOTE_NODES="192.168.1.36 192.168.1.2"
-SSH_USER="root"
+# Node phụ cần sync (format: user@ip)
+REMOTE_NODES="root@192.168.1.36 ans@192.168.1.2"
 SSH_KEY="/root/.ssh/fastnetmon_key"
 LOG_FILE="/var/log/fastnetmon_mitigation.log"
 # =================================
@@ -220,15 +219,16 @@ nftables_remote() {
     local node="$1"
     if [ "$ACTION" = "ban" ]; then
         ssh -i $SSH_KEY -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-            $SSH_USER@$node \
-            "nft add rule inet fastnetmon ddos_input ip saddr $CLIENT_IP counter drop comment '\"fnm_${CLIENT_IP}\"' 2>/dev/null; \
-             nft add rule inet fastnetmon ddos_forward ip saddr $CLIENT_IP counter drop comment '\"fnm_${CLIENT_IP}\"' 2>/dev/null" \
+            $node \
+            "sudo nft add rule inet fastnetmon ddos_input ip saddr $CLIENT_IP counter drop comment '\"fnm_${CLIENT_IP}\"' 2>/dev/null; \
+             sudo nft add rule inet fastnetmon ddos_forward ip saddr $CLIENT_IP counter drop comment '\"fnm_${CLIENT_IP}\"' 2>/dev/null" \
             2>/dev/null
         log_msg "$node: BLOCKED"
     elif [ "$ACTION" = "unban" ]; then
         ssh -i $SSH_KEY -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-            $SSH_USER@$node \
-            "for chain in ddos_input ddos_forward; do nft -a list chain inet fastnetmon \$chain 2>/dev/null | grep 'fnm_${CLIENT_IP}' | awk '{print \$NF}' | xargs -I{} nft delete rule inet fastnetmon \$chain handle {}; done" \
+            $node \
+            "sudo nft -a list chain inet fastnetmon ddos_input 2>/dev/null | grep 'fnm_${CLIENT_IP}' | awk '{print \$NF}' | xargs -I{} sudo nft delete rule inet fastnetmon ddos_input handle {}; \
+             sudo nft -a list chain inet fastnetmon ddos_forward 2>/dev/null | grep 'fnm_${CLIENT_IP}' | awk '{print \$NF}' | xargs -I{} sudo nft delete rule inet fastnetmon ddos_forward handle {}" \
             2>/dev/null
         log_msg "$node: UNBLOCKED"
     fi
@@ -260,8 +260,7 @@ chmod +x /usr/local/bin/notify_about_attack.sh
 # Emergency unban
 cat > /usr/local/bin/emergency_unban.sh << 'UNBAN'
 #!/usr/bin/env bash
-REMOTE_NODES="192.168.1.36 192.168.1.2"
-SSH_USER="root"
+REMOTE_NODES="root@192.168.1.36 ans@192.168.1.2"
 SSH_KEY="/root/.ssh/fastnetmon_key"
 
 list_banned() {
@@ -270,8 +269,8 @@ list_banned() {
     for node in $REMOTE_NODES; do
         echo "=== $node ==="
         ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-            "$SSH_USER@$node" \
-            "nft list chain inet fastnetmon ddos_input 2>/dev/null | grep 'fnm_'" 2>/dev/null | \
+            "$node" \
+            "sudo nft list chain inet fastnetmon ddos_input 2>/dev/null | grep 'fnm_'" 2>/dev/null | \
             sed 's/.*saddr \([^ ]*\).*/  \1/' | sort -u
     done
     echo ""
@@ -290,8 +289,8 @@ unban_ip() {
     for node in $REMOTE_NODES; do
         for chain in ddos_input ddos_forward; do
             ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-                "$SSH_USER@$node" \
-                "nft -a list chain inet fastnetmon $chain 2>/dev/null | grep 'fnm_${ip}' | awk '{print \$NF}' | xargs -I{} nft delete rule inet fastnetmon $chain handle {}" 2>/dev/null
+                "$node" \
+                "sudo nft -a list chain inet fastnetmon $chain 2>/dev/null | grep 'fnm_${ip}' | awk '{print \$NF}' | xargs -I{} sudo nft delete rule inet fastnetmon $chain handle {}" 2>/dev/null
         done
         echo "  $node: OK"
     done
@@ -307,8 +306,8 @@ unban_all() {
     echo "  daemon2: OK"
     for node in $REMOTE_NODES; do
         ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o StrictHostKeyChecking=no \
-            "$SSH_USER@$node" \
-            "nft flush chain inet fastnetmon ddos_input 2>/dev/null; nft flush chain inet fastnetmon ddos_forward 2>/dev/null" 2>/dev/null
+            "$node" \
+            "sudo nft flush chain inet fastnetmon ddos_input 2>/dev/null; sudo nft flush chain inet fastnetmon ddos_forward 2>/dev/null" 2>/dev/null
         echo "  $node: OK"
     done
     echo "Done."
@@ -339,7 +338,10 @@ echo "CÒN LÀM TIẾP:"
 echo ""
 echo "1. Copy SSH key sang daemon1 & root:"
 echo "   ssh-copy-id -i /root/.ssh/fastnetmon_key root@192.168.1.36"
-echo "   ssh-copy-id -i /root/.ssh/fastnetmon_key root@192.168.1.2"
+echo "   ssh-copy-id -i /root/.ssh/fastnetmon_key ans@192.168.1.2"
+echo ""
+echo "   Trên 192.168.1.2, cho ans quyền chạy nft:"
+echo "   echo 'ans ALL=(root) NOPASSWD: /usr/sbin/nft' | sudo tee /etc/sudoers.d/fastnetmon"
 echo ""
 echo "2. Paste Discord webhook URL:"
 echo "   nano /usr/local/bin/notify_about_attack.sh"
