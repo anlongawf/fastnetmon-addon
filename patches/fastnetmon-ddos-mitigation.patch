@@ -1,0 +1,168 @@
+diff --git a/src/fastnetmon.conf b/src/fastnetmon.conf
+index 5c737ac2..13df16e5 100644
+--- a/src/fastnetmon.conf
++++ b/src/fastnetmon.conf
+@@ -376,6 +376,46 @@ prometheus_port = 9209
+ # Prometheus host
+ prometheus_host = 127.0.0.1
+ 
++###
++### DDoS Active Mitigation
++###
++
++# Master switch for active DDoS mitigation (blocks/rate-limits attacking IPs directly)
++ddos_mitigation = off
++
++# Mitigation mode: block, ratelimit, block_and_ratelimit
++# block - drop all traffic from attacker (XDP + firewall)
++# ratelimit - only rate limit attacker traffic
++# block_and_ratelimit - apply both block and rate limit rules
++ddos_mitigation_mode = block
++
++# XDP/eBPF based firewall - drops packets at driver level (highest performance)
++# Requires Linux kernel 5.x+ and libbpf
++ddos_mitigation_xdp_firewall = off
++
++# Interface to attach XDP firewall program
++ddos_mitigation_xdp_interface = eth0
++
++# Path to compiled XDP firewall BPF object
++ddos_mitigation_xdp_microcode_path = /etc/xdp_firewall_kernel.o
++
++# XDP-level per-IP rate limiting (applied in kernel, very fast)
++ddos_mitigation_xdp_ratelimit = off
++ddos_mitigation_xdp_ratelimit_pps = 50000
++
++# nftables/iptables based firewall rules
++ddos_mitigation_firewall = off
++
++# Firewall backend: nftables or iptables
++ddos_mitigation_firewall_backend = nftables
++
++# Rate limiting via nftables/iptables (applied per banned IP)
++ddos_mitigation_ratelimit = off
++
++# Rate limit thresholds applied when attack detected
++ddos_mitigation_ratelimit_pps = 10000
++ddos_mitigation_ratelimit_mbps = 500
++
+ ###
+ ### Client configuration
+ ###
+diff --git a/src/fastnetmon.cpp b/src/fastnetmon.cpp
+index dbe4a2e9..06f06542 100644
+--- a/src/fastnetmon.cpp
++++ b/src/fastnetmon.cpp
+@@ -66,6 +66,8 @@
+ 
+ #include "bgp_protocol_flow_spec.hpp"
+ 
++#include "actions/ddos_mitigation_action.hpp"
++
+ // Yes, maybe it's not an good idea but with this we can guarantee working code in example plugin
+ #include "example_plugin/example_collector.hpp"
+ 
+@@ -1180,6 +1182,72 @@ bool load_configuration_file() {
+         DEBUG_DUMP_OTHER_PACKETS = configuration_map["dump_other_traffic"] == "on" ? true : false;
+     }
+ 
++    // DDoS Active Mitigation configuration
++    {
++        ddos_mitigation_config_t mitigation_config;
++
++        if (configuration_map.count("ddos_mitigation") != 0) {
++            mitigation_config.enabled = configuration_map["ddos_mitigation"] == "on";
++        }
++
++        if (configuration_map.count("ddos_mitigation_xdp_firewall") != 0) {
++            mitigation_config.xdp_firewall_enabled = configuration_map["ddos_mitigation_xdp_firewall"] == "on";
++        }
++
++        if (configuration_map.count("ddos_mitigation_xdp_interface") != 0) {
++            mitigation_config.xdp_firewall_interface = configuration_map["ddos_mitigation_xdp_interface"];
++        }
++
++        if (configuration_map.count("ddos_mitigation_xdp_microcode_path") != 0) {
++            mitigation_config.xdp_firewall_microcode_path = configuration_map["ddos_mitigation_xdp_microcode_path"];
++        } else {
++            mitigation_config.xdp_firewall_microcode_path = "/etc/xdp_firewall_kernel.o";
++        }
++
++        if (configuration_map.count("ddos_mitigation_firewall") != 0) {
++            mitigation_config.firewall_enabled = configuration_map["ddos_mitigation_firewall"] == "on";
++        }
++
++        if (configuration_map.count("ddos_mitigation_firewall_backend") != 0) {
++            mitigation_config.use_nftables = configuration_map["ddos_mitigation_firewall_backend"] == "nftables";
++        }
++
++        if (configuration_map.count("ddos_mitigation_ratelimit") != 0) {
++            mitigation_config.ratelimit_enabled = configuration_map["ddos_mitigation_ratelimit"] == "on";
++        }
++
++        if (configuration_map.count("ddos_mitigation_ratelimit_pps") != 0) {
++            mitigation_config.ratelimit_pps = convert_string_to_integer(configuration_map["ddos_mitigation_ratelimit_pps"]);
++        }
++
++        if (configuration_map.count("ddos_mitigation_ratelimit_mbps") != 0) {
++            mitigation_config.ratelimit_mbps = convert_string_to_integer(configuration_map["ddos_mitigation_ratelimit_mbps"]);
++        }
++
++        if (configuration_map.count("ddos_mitigation_xdp_ratelimit") != 0) {
++            mitigation_config.xdp_ratelimit_enabled = configuration_map["ddos_mitigation_xdp_ratelimit"] == "on";
++        }
++
++        if (configuration_map.count("ddos_mitigation_xdp_ratelimit_pps") != 0) {
++            mitigation_config.xdp_ratelimit_pps = convert_string_to_integer(configuration_map["ddos_mitigation_xdp_ratelimit_pps"]);
++        }
++
++        if (configuration_map.count("ddos_mitigation_mode") != 0) {
++            std::string mode = configuration_map["ddos_mitigation_mode"];
++            if (mode == "block") {
++                mitigation_config.mode = ddos_mitigation_mode_t::block_only;
++            } else if (mode == "ratelimit") {
++                mitigation_config.mode = ddos_mitigation_mode_t::ratelimit_only;
++            } else if (mode == "block_and_ratelimit") {
++                mitigation_config.mode = ddos_mitigation_mode_t::block_and_ratelimit;
++            }
++        }
++
++        if (mitigation_config.enabled) {
++            ddos_mitigation_init(mitigation_config);
++        }
++    }
++
+     return true;
+ }
+ 
+diff --git a/src/fastnetmon_logic.cpp b/src/fastnetmon_logic.cpp
+index 41f7cdb2..b9f0e0e2 100644
+--- a/src/fastnetmon_logic.cpp
++++ b/src/fastnetmon_logic.cpp
+@@ -47,6 +47,8 @@
+ 
+ #include "actions/exabgp_action.hpp"
+ 
++#include "actions/ddos_mitigation_action.hpp"
++
+ // Traffic output formats
+ #include "traffic_output_formats/protobuf/protobuf_traffic_format.hpp"
+ 
+@@ -1364,6 +1366,17 @@ void call_blackhole_actions_per_host(attack_action_t attack_action,
+ #endif
+     }
+ 
++    // DDoS active mitigation (XDP firewall + nftables/iptables + rate limiting)
++    if (attack_action == attack_action_t::ban) {
++        std::string ipv6_str = ipv6 ? client_ip_as_string : "";
++        boost::thread mitigation_thread(ddos_mitigation_ban, attack_action, client_ip, client_ip_as_string, ipv6, ipv6_str, current_attack);
++        mitigation_thread.detach();
++    } else if (attack_action == attack_action_t::unban) {
++        std::string ipv6_str = ipv6 ? client_ip_as_string : "";
++        boost::thread mitigation_thread(ddos_mitigation_unban, client_ip, client_ip_as_string, ipv6, ipv6_str);
++        mitigation_thread.detach();
++    }
++
+     if (usage_stats) {
+         boost::thread attack_report_thread(send_attack_data_to_reporting_server, basic_attack_information_in_json);
+         attack_report_thread.detach();
